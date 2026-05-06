@@ -10,6 +10,10 @@ import re
 import json
 import subprocess
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import time
+start = time.time()
 
 try:
     import networkx as nx
@@ -74,9 +78,41 @@ def is_function_def(source_line: str) -> bool:
     return True
 
 
+def _process_file(args: tuple) -> dict[str, list[dict]]:
+    """
+    1ファイル分の `global -f` を実行してタグを収集し、ローカル辞書で返す。
+    ThreadPoolExecutor から呼ばれる（共有状態への書き込みなし）。
+    """
+    c_file, project_dir = args
+    local: dict[str, list[dict]] = {}
+    result = subprocess.run(
+        ["global", "-f", str(c_file)],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return local
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        tag_name = parts[0]
+        try:
+            lineno = int(parts[1])
+        except ValueError:
+            continue
+        filepath = parts[2]
+        local.setdefault(tag_name, []).append(
+            {"file": filepath, "line": lineno, "source_line": "", "is_func": False}
+        )
+    return local
+
+
 def collect_all_tags(project_dir: Path) -> dict[str, dict]:
     """
-    global -f <file> で C/C++ ソースファイルのタグを収集。
+    global -f <file> を ThreadPoolExecutor で並列実行してタグを収集。
+    各スレッドはローカル辞書のみ操作し、完了後にメインスレッドでマージ。
     Returns: { tag_name: { file, line, source_line, is_func, category } }
     """
     print("[2/4] タグを収集中...")
@@ -85,31 +121,17 @@ def collect_all_tags(project_dir: Path) -> dict[str, dict]:
     for ext in C_EXTENSIONS:
         c_files.extend(project_dir.rglob(f"*{ext}"))
 
+    # ── 並列サブプロセス実行（案B: スレッドごとに独立した local dict を返す） ──
     raw_tags: dict[str, list[dict]] = {}
+    args_list = [(f, project_dir) for f in c_files]
 
-    for c_file in c_files:
-        result = subprocess.run(
-            ["global", "-f", str(c_file)],
-            cwd=project_dir,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            continue
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-            tag_name = parts[0]
-            try:
-                lineno = int(parts[1])
-            except ValueError:
-                continue
-            filepath = parts[2]
-            raw_tags.setdefault(tag_name, []).append(
-                {"file": filepath, "line": lineno, "source_line": "", "is_func": False}
-            )
+    with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 4)) as executor:
+        for local in executor.map(_process_file, args_list):
+            # メインスレッドで順次マージ（競合なし）
+            for tag_name, entries in local.items():
+                raw_tags.setdefault(tag_name, []).extend(entries)
 
+    # ── ソース行の読み込みと is_func 判定 ──
     file_lines_cache: dict[str, list[str]] = {}
 
     def read_lines(fp_str: str) -> list[str]:
@@ -167,6 +189,12 @@ def build_scope_map(tags: dict) -> dict[str, list[tuple]]:
     return scope_map
 
 
+# 「識別子(」を全て拾うシンプルなパターン（ループ外で1回だけコンパイル）
+_CALL_PATTERN = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+_STRIP_LINE_COMMENT  = re.compile(r'//.*')
+_STRIP_BLOCK_COMMENT = re.compile(r'/\*.*?\*/')
+
+
 def extract_calls(
     source_lines: list[str],
     start: int,
@@ -174,17 +202,22 @@ def extract_calls(
     known_tags: set[str],
     self_name: str,
 ) -> set[str]:
-    pattern = re.compile(
-        r'\b(' + '|'.join(re.escape(f) for f in known_tags) + r')\s*\('
-    )
+    """
+    [start, end] 行範囲で既知タグへの呼び出しを抽出（自己再帰除外）。
+
+    最適化:
+    - _CALL_PATTERN で「任意の識別子 + (」を全て拾い
+    - known_tags の set に含まれるかを O(1) で判定
+    → 巨大 alternation 正規表現の生成・マッチを回避
+    """
     callees: set[str] = set()
     for lineno in range(start - 1, min(end, len(source_lines))):
         line = source_lines[lineno]
-        stripped = re.sub(r'//.*', '', line)
-        stripped = re.sub(r'/\*.*?\*/', '', stripped)
-        for m in pattern.finditer(stripped):
+        stripped = _STRIP_LINE_COMMENT.sub('', line)
+        stripped = _STRIP_BLOCK_COMMENT.sub('', stripped)
+        for m in _CALL_PATTERN.finditer(stripped):
             callee = m.group(1)
-            if callee != self_name:
+            if callee != self_name and callee in known_tags:
                 callees.add(callee)
     return callees
 
@@ -196,7 +229,7 @@ def build_call_graph(
 ) -> nx.DiGraph:
     print("[3/4] コールグラフを構築中...")
     G = nx.DiGraph()
-    known_tags = set(tags.keys())
+    known_tags: set[str] = set(tags.keys())
 
     for name, info in tags.items():
         G.add_node(
@@ -305,10 +338,6 @@ def generate_file_colors(files: list[str]) -> dict[str, dict]:
 
 _DEFAULT_FONT_SIZE = 11
 
-# ボタングリッド: 24px ボタン + 14px 隙間 = 38px ピッチ
-# D-pad:   up(38,76)  left(0,38)  right(76,38)  down(38,0)
-# zoom列:  left = 122px (8px ギャップ)
-#          zoomIn(122,76)  zoomExtends(122,38)  zoomOut(122,0)
 _NAV_BUTTON_CSS = """
 <style>
 /* ナビゲーションボタン: 背景透明・グレー系・枠なし */
@@ -935,6 +964,7 @@ def main() -> None:
     generate_html(G, output_html, source_map)
 
     print(f"\n✅ 完了！ → {output_html}")
+    print(f"⏱ 総処理時間: {time.time() - start:.2f}秒")
 
 
 if __name__ == "__main__":
